@@ -36,6 +36,14 @@ import pandas as pd
 from dataclasses import dataclass
 from typing import List, Dict
 
+# 可选绘图依赖（若未安装 matplotlib 则跳过可视化）
+try:
+    import matplotlib
+    matplotlib.use('Agg')  # 后端设为无界面
+    import matplotlib.pyplot as plt
+except Exception:  # noqa
+    plt = None
+
 EPS = 1e-12
 
 @dataclass
@@ -46,6 +54,7 @@ class GMResult:
     trend_raw: float
     trend: float  # 可能归一化后的趋势
     points_used: int
+    predicted_next: float | None = None  # 预测下一期原始得分（季度得分）
 
 def compute_entropy_weights(df: pd.DataFrame, indicator_cols: List[str]) -> pd.DataFrame:
     """按给定数据子集（单季度）计算熵值与权重。"""
@@ -69,12 +78,17 @@ def compute_entropy_weights(df: pd.DataFrame, indicator_cols: List[str]) -> pd.D
     })
 
 def gm11_trend(series: List[float]) -> Dict[str, float]:
-    """GM(1,1) 参数估计与趋势值计算。"""
+    """GM(1,1) 参数估计、趋势值与下一期预测。
+
+    返回:
+        alpha_hat, beta_hat, trend_raw, predicted_next
+        其中 predicted_next 为预测下一期原始序列值 x0_hat(n+1)。
+    """
     x0 = np.array(series, dtype=float)
     n = len(x0)
     if n < 2 or np.allclose(x0.std(), 0):
         mean_val = float(np.mean(x0)) if n > 0 else 0.0
-        return dict(alpha_hat=0.0, beta_hat=mean_val, trend_raw=mean_val)
+        return dict(alpha_hat=0.0, beta_hat=mean_val, trend_raw=mean_val, predicted_next=mean_val)
     x1 = np.cumsum(x0)
     z = 0.5 * (x1[1:] + x1[:-1])
     B = np.column_stack((-z, np.ones(n - 1)))
@@ -84,12 +98,20 @@ def gm11_trend(series: List[float]) -> Dict[str, float]:
         a_hat, b_hat = params[0], params[1]
     except np.linalg.LinAlgError:
         mean_val = float(np.mean(x0))
-        return dict(alpha_hat=0.0, beta_hat=mean_val, trend_raw=mean_val)
+        return dict(alpha_hat=0.0, beta_hat=mean_val, trend_raw=mean_val, predicted_next=mean_val)
     if abs(a_hat) < 1e-8:
         trend_raw = float(b_hat)
+        # 线性近似: 下一期预测用最后一期值
+        predicted_next = float(x0[-1])
     else:
         trend_raw = float((b_hat / a_hat) * (1 - math.exp(-a_hat)))
-    return dict(alpha_hat=float(a_hat), beta_hat=float(b_hat), trend_raw=trend_raw)
+        # GM(1,1) 解：x1_hat(k) = (x0(1) - b/a)*exp(-a*(k-1)) + b/a
+        # 原序列预测: x0_hat(k) = x1_hat(k) - x1_hat(k-1)
+        c = x0[0] - b_hat / a_hat
+        x1_hat_prev = (c * math.exp(-a_hat * (n - 1))) + b_hat / a_hat
+        x1_hat_next = (c * math.exp(-a_hat * n)) + b_hat / a_hat
+        predicted_next = float(x1_hat_next - x1_hat_prev)
+    return dict(alpha_hat=float(a_hat), beta_hat=float(b_hat), trend_raw=trend_raw, predicted_next=predicted_next)
 
 def rename_empty_columns(df: pd.DataFrame) -> pd.DataFrame:
     new_cols = []
@@ -109,10 +131,14 @@ def main():
     PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
     INPUT_PATH = os.path.join(PROJECT_ROOT, 'build', '标准化数据集.csv')  # 标准化数据集路径
     OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'build')                     # 输出目录
-    ALPHA = 0.3              # 趋势项权重 α ∈ [0,1]
+    ALPHA = 0.3              # 趋势项权重 α ∈ [0,1] （若 AUTO_ALPHA=True 将被覆盖）
     NORMALIZE_TREND = True   # 是否对趋势值做 Min-Max 归一化
     TOP_UNORDERED_N = 5      # 不排序奖励人数
     TOP_RANKED_N = 3         # 排序奖励人数
+    AUTO_ALPHA = True        # 是否自动寻优 alpha
+    ALPHA_GRID = np.arange(0.0, 1, 0.05)  # 寻优网格 (含0)
+    # 目标：使综合得分与“预测下一期得分”具有最高 Spearman 相关，同时保留一定区分度。
+    # 复合目标函数 J = corr_spearman(S, predicted_next) + 0.2 * standardized(range)
     # ======================
 
     alpha = max(0.0, min(1.0, ALPHA))
@@ -160,7 +186,13 @@ def main():
             if not rows.empty:
                 series.append(float(rows['季度得分'].iloc[0]))
         gm_dict = gm11_trend(series)
-        gm_results.append(GMResult(person=person, alpha_hat=gm_dict['alpha_hat'], beta_hat=gm_dict['beta_hat'], trend_raw=gm_dict['trend_raw'], trend=gm_dict['trend_raw'], points_used=len(series)))
+        gm_results.append(GMResult(person=person,
+                                   alpha_hat=gm_dict['alpha_hat'],
+                                   beta_hat=gm_dict['beta_hat'],
+                                   trend_raw=gm_dict['trend_raw'],
+                                   trend=gm_dict['trend_raw'],
+                                   points_used=len(series),
+                                   predicted_next=gm_dict.get('predicted_next')))
 
     if normalize_trend and gm_results:
         raw_vals = np.array([g.trend_raw for g in gm_results], dtype=float)
@@ -172,12 +204,86 @@ def main():
         for g, nv in zip(gm_results, norm):
             g.trend = float(nv)
 
-    gm_df = pd.DataFrame([{'人员': g.person, 'GM_alpha_hat': g.alpha_hat, 'GM_beta_hat': g.beta_hat, '趋势_raw': g.trend_raw, '趋势值': g.trend, '序列点数': g.points_used} for g in gm_results])
+    gm_df = pd.DataFrame([{'人员': g.person,
+                           'GM_alpha_hat': g.alpha_hat,
+                           'GM_beta_hat': g.beta_hat,
+                           '趋势_raw': g.trend_raw,
+                           '趋势值': g.trend,
+                           '预测下一期得分': g.predicted_next,
+                           '序列点数': g.points_used} for g in gm_results])
 
     avg_scores = quarter_scores_df.groupby('人员')['季度得分'].mean().reset_index().rename(columns={'季度得分': '平均季度绩效'})
-    merged = avg_scores.merge(gm_df[['人员', '趋势值']], on='人员', how='left')
-    merged['趋势值'].fillna(0, inplace=True)
-    merged['最终综合得分'] = merged['平均季度绩效'] + alpha * merged['趋势值']
+    merged_base = avg_scores.merge(gm_df[['人员', '趋势值', '预测下一期得分']], on='人员', how='left')
+    merged_base['趋势值'].fillna(0, inplace=True)
+
+    alpha_used = alpha
+    alpha_search_table = None
+    if AUTO_ALPHA:
+        # === 方案1: 使用标准化后的 avg 与 trend 进行 alpha 网格寻优 (不改变最终得分计算) ===
+        rows_metrics = []
+        pred_next = merged_base['预测下一期得分']
+        if pred_next.isna().any():
+            pred_next = pred_next.fillna(pred_next.mean())
+        avg_col = merged_base['平均季度绩效'].astype(float)
+        trend_col = merged_base['趋势值'].astype(float)
+        avg_mean, avg_std = float(avg_col.mean()), float(avg_col.std(ddof=0))
+        trend_mean, trend_std = float(trend_col.mean()), float(trend_col.std(ddof=0))
+        if avg_std < 1e-12:
+            avg_z = np.zeros_like(avg_col, dtype=float)
+        else:
+            avg_z = (avg_col - avg_mean) / avg_std
+        if trend_std < 1e-12:
+            trend_z = np.zeros_like(trend_col, dtype=float)
+        else:
+            trend_z = (trend_col - trend_mean) / trend_std
+
+        for a in ALPHA_GRID:
+            S_z = avg_z + a * trend_z  # 仅用于择优的标准化组合
+            rng = S_z.max() - S_z.min()
+            std = S_z.std(ddof=0)
+            if S_z.nunique() > 1 and pred_next.nunique() > 1:
+                corr = S_z.rank(method='average').corr(pred_next.rank(method='average'))
+            else:
+                corr = 0.0
+            rows_metrics.append({'alpha': a, 'corr_pred_next': corr, 'range': rng, 'std': std})
+        alpha_df = pd.DataFrame(rows_metrics)
+        # 归一化 range
+        if alpha_df['range'].max() - alpha_df['range'].min() > 0:
+            alpha_df['range_norm'] = (alpha_df['range'] - alpha_df['range'].min()) / (alpha_df['range'].max() - alpha_df['range'].min())
+        else:
+            alpha_df['range_norm'] = 0.0
+        # 复合目标 J
+        alpha_df['J'] = alpha_df['corr_pred_next'] + 0.2 * alpha_df['range_norm']
+        # 选择 J 最大的 alpha；若并列取较小 alpha（保守）
+        best_row = alpha_df.sort_values(['J', 'alpha'], ascending=[False, True]).iloc[0]
+        alpha_used = float(best_row['alpha'])
+        alpha_search_table = alpha_df
+        # === 可视化 alpha-J 曲线 ===
+        if plt is not None and not alpha_df.empty:
+            try:
+                fig, ax1 = plt.subplots(figsize=(6, 4), dpi=130)
+                ax1.plot(alpha_df['alpha'], alpha_df['J'], marker='o', label='J(复合目标)')
+                ax1.plot(alpha_df['alpha'], alpha_df['corr_pred_next'], marker='s', linestyle='--', label='Spearman相关')
+                ax1.plot(alpha_df['alpha'], alpha_df['range_norm'], marker='^', linestyle=':', label='range_norm')
+                ax1.axvline(alpha_used, color='red', linestyle='-.', label=f'最佳α={alpha_used:.2f}')
+                ax1.set_xlabel('alpha')
+                ax1.set_ylabel('指标值 (标准化 J / 相关 / range_norm)')
+                ax1.set_title('Alpha 敏感性与复合目标 J')
+                ax1.grid(alpha=0.3, linestyle=':')
+                ax1.legend(fontsize=8)
+                fig.tight_layout()
+                alpha_plot_path = os.path.join(OUTPUT_DIR, 'alpha_sensitivity.png')
+                fig.savefig(alpha_plot_path, bbox_inches='tight')
+                plt.close(fig)
+            except Exception as _e:  # 捕获绘图失败不影响主流程
+                alpha_plot_path = None
+        else:
+            alpha_plot_path = None
+    else:
+        alpha_plot_path = None
+    # 用最终 alpha_used 计算得分
+    merged = merged_base.copy()
+    merged['最终综合得分'] = merged['平均季度绩效'] + alpha_used * merged['趋势值']
     merged = merged.sort_values('最终综合得分', ascending=False).reset_index(drop=True)
 
     top_unordered_n = max(1, TOP_UNORDERED_N)
@@ -196,22 +302,29 @@ def main():
         merged.to_excel(writer, sheet_name='最终综合排名', index=False)
         top_ranked_df.to_excel(writer, sheet_name=f'前{top_ranked_n}_排序', index=False)
         top_unordered_df.to_excel(writer, sheet_name=f'前{top_unordered_n}_不排序', index=False)
+        if alpha_search_table is not None:
+            alpha_search_table.to_excel(writer, sheet_name='Alpha敏感性', index=False)
 
     summary = {
-        'alpha': alpha,
+        'alpha_input': alpha,
+        'alpha_used': alpha_used,
+        'auto_alpha': AUTO_ALPHA,
+        'alpha_grid': list(ALPHA_GRID if AUTO_ALPHA else [alpha]),
         'normalize_trend': normalize_trend,
+    'alpha_selection_standardized': True if AUTO_ALPHA else False,
         'threshold': threshold,
         'top_unordered_n': top_unordered_n,
         'top_ranked_n': top_ranked_n,
         'top_unordered_persons': list(unordered_set),
-        'top_ranked': top_ranked_df[['人员', '最终综合得分']].to_dict('records')
+    'top_ranked': top_ranked_df[['人员', '最终综合得分']].to_dict('records'),
+    'alpha_plot': 'alpha_sensitivity.png' if (AUTO_ALPHA and alpha_plot_path) else None
     }
     pd.Series(summary).to_json(os.path.join(OUTPUT_DIR, 'dynamic_model_summary.json'), force_ascii=False, indent=2)
 
     print("=== 动态熵权 + GM(1,1) 模型完成 ===")
     print(f"输入文件: {INPUT_PATH}")
     print(f"季度数量: {len(quarters)} | 指标数量: {len(indicator_cols)} | 人员数: {len(merged)}")
-    print(f"趋势权重 alpha = {alpha} | 趋势归一化: {normalize_trend}")
+    print(f"趋势权重 alpha_used = {alpha_used} (输入默认 {alpha}) | AUTO_ALPHA={AUTO_ALPHA} | 趋势归一化: {normalize_trend}")
     print(f"不排序奖励人数: {top_unordered_n} (阈值={threshold:.6f}) -> 人员集合: {unordered_set}")
     print(f"排序奖励前{top_ranked_n}:")
     for i, r in top_ranked_df.iterrows():
