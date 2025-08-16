@@ -41,6 +41,34 @@ try:
     import matplotlib
     matplotlib.use('Agg')  # 后端设为无界面
     import matplotlib.pyplot as plt
+    # 配置中文字体，避免输出图中中文变成方框。按候选列表找到系统已安装字体。
+    try:
+        from matplotlib import font_manager
+        candidate_fonts = [
+            'SimHei',            # 黑体
+            'Microsoft YaHei',   # 微软雅黑
+            'Microsoft YaHei UI',
+            'STHeiti',
+            'Heiti TC',
+            'PingFang SC',
+            'Source Han Sans CN',
+            'Source Han Sans SC',
+            'Arial Unicode MS'
+        ]
+        available = set(f.name for f in font_manager.fontManager.ttflist)
+        chosen = None
+        for f in candidate_fonts:
+            if f in available:
+                chosen = f
+                break
+        if chosen:
+            matplotlib.rcParams['font.sans-serif'] = [chosen]
+            matplotlib.rcParams['axes.unicode_minus'] = False  # 正常显示负号
+        else:
+            # 若无中文字体，退回默认但依然避免负号问题
+            matplotlib.rcParams['axes.unicode_minus'] = False
+    except Exception:
+        pass
 except Exception:  # noqa
     plt = None
 
@@ -129,14 +157,16 @@ def main():
     # ===== 可配置区域 =====
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
     PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
-    INPUT_PATH = os.path.join(PROJECT_ROOT, 'build', '标准化数据集.csv')  # 标准化数据集路径
-    OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'build')                     # 输出目录
+    INPUT_PATH = os.path.join(PROJECT_ROOT, 'build','problem1', '标准化数据集.csv')  # 标准化数据集路径
+    OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'build','problem1')                     # 输出目录
     ALPHA = 0.3              # 趋势项权重 α ∈ [0,1] （若 AUTO_ALPHA=True 将被覆盖）
     NORMALIZE_TREND = True   # 是否对趋势值做 Min-Max 归一化
     TOP_UNORDERED_N = 5      # 不排序奖励人数
     TOP_RANKED_N = 3         # 排序奖励人数
     AUTO_ALPHA = True        # 是否自动寻优 alpha
     ALPHA_GRID = np.arange(0.0, 1, 0.05)  # 寻优网格 (含0)
+    PLOT_FIGSIZE = (8, 5)    # 可视化图尺寸 (宽, 高) 英寸
+    PLOT_DPI = 240           # 图像 DPI 提升分辨率
     # 目标：使综合得分与“预测下一期得分”具有最高 Spearman 相关，同时保留一定区分度。
     # 复合目标函数 J = corr_spearman(S, predicted_next) + 0.2 * standardized(range)
     # ======================
@@ -261,7 +291,7 @@ def main():
         # === 可视化 alpha-J 曲线 ===
         if plt is not None and not alpha_df.empty:
             try:
-                fig, ax1 = plt.subplots(figsize=(6, 4), dpi=130)
+                fig, ax1 = plt.subplots(figsize=PLOT_FIGSIZE, dpi=PLOT_DPI)
                 ax1.plot(alpha_df['alpha'], alpha_df['J'], marker='o', label='J(复合目标)')
                 ax1.plot(alpha_df['alpha'], alpha_df['corr_pred_next'], marker='s', linestyle='--', label='Spearman相关')
                 ax1.plot(alpha_df['alpha'], alpha_df['range_norm'], marker='^', linestyle=':', label='range_norm')
@@ -273,7 +303,7 @@ def main():
                 ax1.legend(fontsize=8)
                 fig.tight_layout()
                 alpha_plot_path = os.path.join(OUTPUT_DIR, 'alpha_sensitivity.png')
-                fig.savefig(alpha_plot_path, bbox_inches='tight')
+                fig.savefig(alpha_plot_path, dpi=PLOT_DPI, bbox_inches='tight')
                 plt.close(fig)
             except Exception as _e:  # 捕获绘图失败不影响主流程
                 alpha_plot_path = None

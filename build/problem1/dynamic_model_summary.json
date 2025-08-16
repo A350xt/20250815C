@@ -30,11 +30,11 @@
   "top_unordered_n":5,
   "top_ranked_n":3,
   "top_unordered_persons":[
-    "c11",
-    "c62",
-    "c21",
     "B4",
-    "c22"
+    "c11",
+    "c22",
+    "c62",
+    "c21"
   ],
   "top_ranked":[
     {
